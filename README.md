@@ -9,33 +9,33 @@ Two parameterisations are explored: learning $\kappa^{\mathrm{NN}}$ directly (`n
 The neural SDE evolves the log-price $X_t = \log S_t$ and variance $V_t$ as
 
 $$
-dX_t = \left(r - \tfrac{1}{2}V_t\right)dt + \sqrt{V_t}\,dB_t, \qquad dV_t = \kappa^{\mathrm{NN}}(V_t)\,dt + \nu\sqrt{V_t}\,dW_t,
+dX_t = \left(r - \tfrac{1}{2}V_t\right)dt + \sqrt{V_t} dB_t, \qquad dV_t = \kappa^{\mathrm{NN}}(V_t) dt + \nu\sqrt{V_t} dW_t,
 $$
 
-with $d\langle B, W\rangle_t = \rho\,dt$. This is a Heston-type model with the drift $\kappa(\theta - v)$ replaced by a small feedforward network evaluated at the current variance level.
+with $d\langle B, W\rangle_t = \rho dt$. This is a Heston-type model with the drift $\kappa(\theta - v)$ replaced by a small feedforward network evaluated at the current variance level.
 
 The Girsanov density connecting the simulation measure $\mathbb{P}$ to the pricing measure $\mathbb{Q}$ is
 
 $$
-Z_T = \exp\!\left(-\int_0^T \varphi_2(V_s)\,dW_s - \frac{1}{2}\int_0^T \varphi_2(V_s)^2\,ds\right),
+Z_T = \exp \left(-\int_0^T \varphi_2(V_s) dW_s - \frac{1}{2}\int_0^T \varphi_2(V_s)^2 ds\right),
 $$
 
 where the market price of risk in the variance direction is
 
 $$
-\varphi_2(v) = \frac{\kappa^{\mathrm{NN}}(v) - \kappa(\theta - v)}{\nu\sqrt{1 - \rho^2}\,\sqrt{v}}.
+\varphi_2(v) = \frac{\kappa^{\mathrm{NN}}(v) - \kappa(\theta - v)}{\nu\sqrt{1 - \rho^2}\sqrt{v}}.
 $$
 
 Option prices are computed as importance-weighted Monte Carlo estimates,
 
 $$
-C^{\mathrm{model}}(K, T) = \mathbb{E}^{\mathbb{P}}\!\left[\max(S_T - K,\, 0) \cdot Z_T\right],
+C^{\mathrm{model}}(K, T) = \mathbb{E}^{\mathbb{P}}\left[\max(S_T - K, 0) \cdot Z_T\right],
 $$
 
 and the network is trained by minimising a vega-weighted squared relative pricing error plus a penalty enforcing $\mathbb{E}[Z_T] = 1$:
 
 $$
-\mathcal{L} = \sum_{K,T} w_{K,T}\,\frac{\bigl(C^{\mathrm{model}}(K,T) - C^{\mathrm{mkt}}(K,T)\bigr)^2}{C^{\mathrm{mkt}}(K,T)} \;+\; \lambda\,\bigl(\mathbb{E}[Z_T] - 1\bigr)^2.
+\mathcal{L} = \sum_{K,T} w_{K,T}\frac{\bigl(C^{\mathrm{model}}(K,T) - C^{\mathrm{mkt}}(K,T)\bigr)^2}{C^{\mathrm{mkt}}(K,T)} + \lambda \bigl(\mathbb{E}[Z_T] - 1\bigr)^2.
 $$
 
 The variance paths are discretised with a Milstein scheme; $Z_T$ is computed in multiplicative form with the corresponding Milstein correction.
@@ -80,8 +80,6 @@ Training converges on the synthetic Heston surface (25 strikes $\times$ 6 maturi
 ## Known limitations
 
 - Tested only on synthetic Heston data; no real market surfaces.
-- Feller condition ($2\kappa\theta > \nu^2$) is violated for the default parameters — paths can reach $V = 0$, requiring post-hoc clamping that biases the Girsanov weights.
 - $\varphi_1 = 0$ is assumed throughout (no measure change in the price direction).
 - Milstein correction for the *price* path is not yet implemented.
 - VIX option pricing infrastructure exists in `lib/options.py` but is not wired into the training loop.
-- No random seeds are set; results are not reproducible across runs.
