@@ -93,17 +93,45 @@ class NSDE(SampleModel):
                          - self.rho * integral_12 - 0.5 * integral_1122)[:, maturity_idx].squeeze()
 
     def get_girsanov_matrix_diff(self, maturity_idx, vol_path, dW, milstein=True):
+        """Compute the Radon-Nikodym density Z at each requested maturity.
+
+        Multiplicative discretisation of dZ = -Z φ₂ dW - ½ Z φ₂² dt:
+            factor_i = 1 - φ₂(V_i) ΔW_i + ½ φ₂(V_i)² (ΔW_i² - dt)   [Milstein]
+
+        Z_k = ∏_{i<k} factor_i,  Z_0 = 1.
+
+        Milstein factors are computed before the Z_0=1 shift so that
+        the correction for step i is applied to factor i, not factor i-1.
+        A Milstein factor can be negative when φ₂ > 1/√dt (which occurs
+        near V=0 when the Feller condition is violated); values are clamped
+        to zero to keep Z a valid density.
+
+        Args:
+            maturity_idx: 1-D integer tensor of time-step indices.
+            vol_path: variance paths, shape (N, n_steps+1).
+            dW: Brownian increments, shape (N, n_steps+1, 2).
+            milstein: include the Milstein correction term.
+
+        Returns:
+            Z at requested maturities, shape (N, len(maturity_idx)).
+        """
         vol_path = vol_path.reshape(vol_path.shape[0], vol_path.shape[1], -1)
         phi_2_eval = self.phi_2(vol_path)
-        delta_Z = 1 - phi_2_eval * dW[:, :, 1, None]
-        # enforce Z_0 = 1
-        delta_Z = torch.cat([torch.ones((delta_Z.shape[0], 1, delta_Z.shape[2]), device=device), delta_Z],
-                            dim=1)[:, :-1, :]
-        milstein_term = .5*torch.square(phi_2_eval)*(torch.square(dW[:, :, 1, None]) - self.dt)
+
+        factors = 1.0 - phi_2_eval * dW[:, :, 1, None]
         if milstein:
-            delta_Z += milstein_term
-        # delta_Z[:, 0, 0] = 1
-        return torch.cumprod(delta_Z, dim=1)[:, maturity_idx].squeeze()
+            factors = factors + 0.5 * torch.square(phi_2_eval) * (
+                torch.square(dW[:, :, 1, None]) - self.dt
+            )
+
+        delta_Z = torch.cat(
+            [torch.ones((factors.shape[0], 1, factors.shape[2]), device=device), factors],
+            dim=1
+        )[:, :-1, :]
+
+        Z = torch.cumprod(delta_Z, dim=1)
+        Z = torch.clamp(Z, min=0.0)
+        return Z[:, maturity_idx].squeeze()
 
     def get_payoff_matrix(self, strikes, maturity_idx, price_path):
         strikes = strikes.reshape(-1, strikes.shape[0])
@@ -136,18 +164,35 @@ class NSDE(SampleModel):
                 if early_stopping.early_stop or (loss.item() < 5e-8):
                     break
 
-    def _loss_function(self, market_prices, model_prices, Z, lambd=0.1, weights=None):
+    def _loss_function(self, market_prices, model_prices, Z, lambd=0.1, lambd_var=0.01, weights=None):
+        """Compute the training loss.
+
+        Args:
+            market_prices: target option prices, shape (n_strikes, n_maturities).
+            model_prices: model option prices, same shape.
+            Z: Radon-Nikodym weights, shape (N_paths, n_maturities).
+            lambd: weight on the E[Z]=1 martingale penalty.
+            lambd_var: weight on the Var(Z) penalty.  Penalising variance
+                prevents a small number of paths from dominating the
+                importance-weighted estimate.
+            weights: denominator for the relative pricing error; defaults
+                to market_prices + 1e-6.
+
+        Returns:
+            Scalar loss tensor.
+        """
         if weights is None:
             weights = market_prices + 1e-6
 
         mse_loss_func = nn.MSELoss()
+
         def loss_func(target, output, weight):
-            """MARE/MSRE loss function"""
             return torch.mean(torch.square((target - output)) / weight)
 
         price_loss = loss_func(market_prices, model_prices, weight=weights)
-        girsanov_loss = mse_loss_func(Z.mean(dim=0), torch.ones(Z.shape[1], device=device))
-        return price_loss + lambd * girsanov_loss
+        girsanov_mean_loss = mse_loss_func(Z.mean(dim=0), torch.ones(Z.shape[1], device=device))
+        girsanov_var_loss = Z.var(dim=0).mean()
+        return price_loss + lambd * girsanov_mean_loss + lambd_var * girsanov_var_loss
 
     def train(self, market_prices, strikes, maturity_idx, price_path, vol_path, dW,
               market_vix_prices=None, vix_strikes=None, vix_path=None,
@@ -181,11 +226,17 @@ class NSDE(SampleModel):
                     loss += self._loss_function(market_vix_prices, model_vix_prices, Z, lambd=0., weights=None)
 
                 loss.backward()
-                nn.utils.clip_grad_norm_(self.nsde_params, 1.)
+                grad_norm = nn.utils.clip_grad_norm_(self.nsde_params, 1.)
                 optimizer_nsde.step()
                 scheduler_nsde.step()
 
-                t_epoch.set_postfix(lr=f'{scheduler_nsde.get_last_lr()[0]:.2e}', loss=f'{loss.item():.2e}')
+                t_epoch.set_postfix(
+                    lr=f'{scheduler_nsde.get_last_lr()[0]:.2e}',
+                    loss=f'{loss.item():.2e}',
+                    grad=f'{grad_norm:.2e}',
+                    Z_mean=f'{Z.mean().item():.3f}',
+                    Z_std=f'{Z.std().item():.3f}',
+                )
 
                 early_stopping(new_loss=loss.item(), old_loss=old_loss)
                 if early_stopping.early_stop:
@@ -250,6 +301,9 @@ class NSDE(SampleModel):
 
 
 if __name__ == '__main__':
+    torch.manual_seed(42)
+    np.random.seed(42)
+
     market_params = dict(V0=0.02, kappa=1.5, theta=0.06, nu=1., rho=-0.7)
     np_data = np.load('./data/heston_{}={V0}_{}={kappa}_{}={theta}_{}={nu}_{}={rho}.npz'.format(
         *market_params, **market_params))
@@ -259,9 +313,9 @@ if __name__ == '__main__':
 
     np_vix_data = np.load('./data/heston_VIX_{}={V0}_{}={kappa}_{}={theta}_{}={nu}_{}={rho}.npz'.format(
         *market_params, **market_params))
-    vix_strikes = np_data['K'].astype(np.float32)
-    vix_maturities = np_data['T'].astype(np.float32)
-    market_vix_prices = np_data['prices'].astype(np.float32)
+    vix_strikes = np_vix_data['K'].astype(np.float32)
+    vix_maturities = np_vix_data['T'].astype(np.float32)
+    market_vix_prices = np_vix_data['prices'].astype(np.float32)
 
     n_steps = 200
     N_paths = 100000
