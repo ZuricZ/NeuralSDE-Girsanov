@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,7 +13,7 @@ import matplotlib.pyplot as plt
 from lib.plot import plot_IV_slices
 from lib.compute_iv import get_vega
 
-device = torch.device('cuda:7' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
 class EarlyStopping:
@@ -40,7 +41,7 @@ class NSDE(SampleModel):
         vars(self).update(vars(sample_model))
 
         # nsde model coefficients
-        self.phi = FFNN(sizes=[1, 15, 15, 1], activation=nn.ReLU, output_activation=nn.Identity).to(device)
+        self.phi = FFNN(sizes=[1, 15, 15, 1], activation=nn.SiLU, output_activation=nn.Identity).to(device)
         self.nsde_params = list(itertools.chain(*[list(self.phi.parameters()),
                                                   # list(self.nsde_mu.parameters())
                                                   ]))
@@ -171,19 +172,16 @@ class NSDE(SampleModel):
 
         price_loss = loss_func(market_prices, model_prices, weight=weights)
         girsanov_mean_loss = mse_loss_func(Z.mean(dim=0), torch.ones(Z.shape[1], device=device))
-        girsanov_var_loss = Z.var(dim=0).mean()
-        return price_loss + lambd * girsanov_mean_loss + lambd_var * girsanov_var_loss
+        return price_loss + lambd * girsanov_mean_loss
 
     def train(self, market_prices, strikes, time_grid, maturity_idx, price_path, vol_path, dW,
               market_vix_prices=None, vix_strikes=None, vix_path=None,
               n_epoch=5000, weights=None):
-        optimizer_nsde = torch.optim.Adam(self.nsde_params, lr=5e-4)  # 5e-5 5e-4
-        # optimizer_nsde = torch.optim.RMSprop(self.nsde_params, lr=1e-4)
-        scheduler_nsde = torch.optim.lr_scheduler.StepLR(optimizer_nsde, 50, gamma=0.99)
-        # scheduler_nsde = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_nsde, 'min',
-        #                                                             factor=0.1, patience=50,
-        #                                                             threshold=5e-8, threshold_mode='abs',
-        #                                                             cooldown=20, verbose=True)
+        optimizer_nsde = torch.optim.Adam(self.nsde_params, lr=5e-4)
+        scheduler_nsde = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer_nsde, 'min',
+                                                                     factor=0.5, patience=100,
+                                                                     threshold=1e-6, threshold_mode='abs',
+                                                                     cooldown=50)
         early_stopping = EarlyStopping(tolerance=200, min_delta=0.)
         # calculate payoffs of the sample model paths
         payoff_matrix = self.get_payoff_matrix(strikes, maturity_idx, price_path)
@@ -210,10 +208,10 @@ class NSDE(SampleModel):
                 loss.backward()
                 grad_norm = nn.utils.clip_grad_norm_(self.nsde_params, 1.)
                 optimizer_nsde.step()
-                scheduler_nsde.step()
+                scheduler_nsde.step(loss)
 
                 t_epoch.set_postfix(
-                    lr=f'{scheduler_nsde.get_last_lr()[0]:.2e}',
+                    lr=f'{optimizer_nsde.param_groups[0]["lr"]:.2e}',
                     loss=f'{loss.item():.2e}',
                     grad=f'{grad_norm:.2e}',
                     Z_mean=f'{Z.mean().item():.3f}',
@@ -286,18 +284,22 @@ if __name__ == '__main__':
     torch.manual_seed(42)
     np.random.seed(42)
 
-    market_params = dict(V0=0.02, kappa=1.5, theta=0.06, nu=1., rho=-0.7)
+    market_params = dict(V0=0.02, kappa=1.5, theta=0.04, nu=0.5, rho=-0.7)
     np_data = np.load('./data/heston_{}={V0}_{}={kappa}_{}={theta}_{}={nu}_{}={rho}.npz'.format(
         *market_params, **market_params))
     strikes = np_data['K'].astype(np.float32)
     maturities = np_data['T'].astype(np.float32)
     market_prices = np_data['prices'].astype(np.float32)
 
-    np_vix_data = np.load('./data/heston_VIX_{}={V0}_{}={kappa}_{}={theta}_{}={nu}_{}={rho}.npz'.format(
-        *market_params, **market_params))
-    vix_strikes = np_vix_data['K'].astype(np.float32)
-    vix_maturities = np_vix_data['T'].astype(np.float32)
-    market_vix_prices = np_vix_data['prices'].astype(np.float32)
+    vix_data_path = './data/heston_VIX_{}={V0}_{}={kappa}_{}={theta}_{}={nu}_{}={rho}.npz'.format(
+        *market_params, **market_params)
+    if os.path.exists(vix_data_path):
+        np_vix_data = np.load(vix_data_path)
+        vix_strikes = np_vix_data['K'].astype(np.float32)
+        vix_maturities = np_vix_data['T'].astype(np.float32)
+        market_vix_prices = np_vix_data['prices'].astype(np.float32)
+    else:
+        vix_strikes = vix_maturities = market_vix_prices = None
 
     n_steps = 100
     N_paths = 100000

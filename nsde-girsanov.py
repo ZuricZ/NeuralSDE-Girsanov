@@ -1,3 +1,4 @@
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -12,7 +13,7 @@ import matplotlib.pyplot as plt
 from lib.plot import plot_IV_slices
 from lib.compute_iv import get_vega
 
-device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
 
 class EarlyStopping:
@@ -191,8 +192,7 @@ class NSDE(SampleModel):
 
         price_loss = loss_func(market_prices, model_prices, weight=weights)
         girsanov_mean_loss = mse_loss_func(Z.mean(dim=0), torch.ones(Z.shape[1], device=device))
-        girsanov_var_loss = Z.var(dim=0).mean()
-        return price_loss + lambd * girsanov_mean_loss + lambd_var * girsanov_var_loss
+        return price_loss + lambd * girsanov_mean_loss
 
     def train(self, market_prices, strikes, maturity_idx, price_path, vol_path, dW,
               market_vix_prices=None, vix_strikes=None, vix_path=None,
@@ -304,23 +304,27 @@ if __name__ == '__main__':
     torch.manual_seed(42)
     np.random.seed(42)
 
-    market_params = dict(V0=0.02, kappa=1.5, theta=0.06, nu=1., rho=-0.7)
+    market_params = dict(V0=0.02, kappa=1.5, theta=0.04, nu=0.5, rho=-0.7)
     np_data = np.load('./data/heston_{}={V0}_{}={kappa}_{}={theta}_{}={nu}_{}={rho}.npz'.format(
         *market_params, **market_params))
     strikes = np_data['K'].astype(np.float32)
     maturities = np_data['T'].astype(np.float32)
     market_prices = np_data['prices'].astype(np.float32)
 
-    np_vix_data = np.load('./data/heston_VIX_{}={V0}_{}={kappa}_{}={theta}_{}={nu}_{}={rho}.npz'.format(
-        *market_params, **market_params))
-    vix_strikes = np_vix_data['K'].astype(np.float32)
-    vix_maturities = np_vix_data['T'].astype(np.float32)
-    market_vix_prices = np_vix_data['prices'].astype(np.float32)
+    vix_data_path = './data/heston_VIX_{}={V0}_{}={kappa}_{}={theta}_{}={nu}_{}={rho}.npz'.format(
+        *market_params, **market_params)
+    if os.path.exists(vix_data_path):
+        np_vix_data = np.load(vix_data_path)
+        vix_strikes = np_vix_data['K'].astype(np.float32)
+        vix_maturities = np_vix_data['T'].astype(np.float32)
+        market_vix_prices = np_vix_data['prices'].astype(np.float32)
+    else:
+        vix_strikes = vix_maturities = market_vix_prices = None
 
     n_steps = 200
     N_paths = 100000
 
-    model = SampleModel(V0=0.02, kappa=2.5, theta=0.04, nu=1., rho=-0.7)
+    model = SampleModel(V0=0.02, kappa=2.5, theta=0.04, nu=0.5, rho=-0.7)
     np_paths = model.generate_paths(T=maturities[-1], n_steps=n_steps, N_paths=N_paths,
                                     scheme='full-truncation', antithetic=True)
     np_vix_path = model.get_VIX(np_paths[1])
